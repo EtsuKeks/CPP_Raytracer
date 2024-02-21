@@ -1,0 +1,200 @@
+#pragma once
+
+#include <image.h>
+#include <options/camera_options.h>
+#include <options/render_options.h>
+
+#include <light.h>
+#include <material.h>
+#include <object.h>
+#include <scene.h>
+
+#include <geometry.h>
+#include <intersection.h>
+#include <ray.h>
+#include <sphere.h>
+#include <triangle.h>
+#include <vector.h>
+#include <cmath>
+
+#include <optional>
+#include <filesystem>
+
+const std::array<Vector, 3> LookAt(const Vector& from, const Vector& to, const Vector& up, const Vector& add_up) {
+    double epsilon = 0.000001;
+    Vector forward = from - to;
+    forward.Normalize();
+    
+    double temp = DotProduct(up, forward);
+    Vector right;
+    if (temp > 1 - epsilon || temp < -1 + epsilon) {
+        right = CrossProduct(add_up, forward);
+    } else {
+        right = CrossProduct(up, forward);
+    }
+    
+    right.Normalize(); 
+    Vector newup = CrossProduct(forward, right);
+
+    std::array<Vector, 3> m;
+
+    m[0][0] = right[0];
+    m[0][1] = right[1];
+    m[0][2] = right[2];
+    m[1][0] = newup[0];
+    m[1][1] = newup[1];
+    m[1][2] = newup[2];
+    m[2][0] = forward[0];
+    m[2][1] = forward[1];
+    m[2][2] = forward[2];
+    return m;
+}
+
+Vector Convert(const Vector& direction, const CameraOptions& options, std::array<Vector, 3>& m) {
+    Vector to_return;
+    Vector converted;
+    converted[0] = 2 * (direction[0] + 0.5) / options.screen_width - 1;
+    converted[1] = 1 - 2 * (direction[1] + 0.5) / options.screen_height;
+    converted[2] = -1;
+    
+    double image_aspect_ratio = static_cast<double>(options.screen_width) / options.screen_height;
+    converted[0] = converted[0] * image_aspect_ratio * std::tan(options.fov / 2);
+    converted[1] = converted[1] * std::tan(options.fov / 2);
+
+    converted.Normalize();
+
+    to_return[0] = converted[0] * m[0][0] + converted[1] * m[1][0] + converted[2] * m[2][0];
+    to_return[1] = converted[0] * m[0][1] + converted[1] * m[1][1] + converted[2] * m[2][1];
+    to_return[2] = converted[0] * m[0][2] + converted[1] * m[1][2] + converted[2] * m[2][2];
+
+    return to_return;
+}
+
+std::optional<Intersection> SetCorrectNormal(const Ray& ray, std::optional<Intersection>& to_change, const Object& object) {
+    Vector barycentric_coords = GetBarycentricCoords(object.polygon, to_change.value().GetPosition());
+    Vector new_normal = *object.GetNormal(0) * barycentric_coords[0] + 
+        *object.GetNormal(1) * barycentric_coords[1] + *object.GetNormal(2) * barycentric_coords[2];
+
+    if (DotProduct(new_normal, ray.GetDirection()) > 0) {
+        -new_normal;
+    }
+
+    return std::make_optional<Intersection>(to_change.value().GetPosition(), new_normal, to_change.value().GetDistance());
+}
+
+std::optional<Intersection> GetFirstIntersection(const Ray& ray, const Scene& scene) {
+    std::vector<Object> objects = scene.GetObjects();
+    std::vector<SphereObject> sphere_objects = scene.GetSphereObjects();
+
+    double closest_length = -1;
+    bool flag_not_found_yet = true;
+    std::optional<Intersection> to_return = std::nullopt;
+    size_t use_to_set_correct_normal = 0;
+
+    for (size_t i = 0; i < objects.size(); ++i) {
+        std::optional<Intersection> other = GetIntersection(ray, objects[i].polygon);
+        if ((other.has_value() && other.value().GetDistance() < closest_length) ||
+            (other.has_value() && flag_not_found_yet)) {
+            flag_not_found_yet = false;
+            to_return = other;
+            use_to_set_correct_normal = i;
+            closest_length = other.value().GetDistance();
+        }
+    }
+
+    if (to_return.has_value() && objects[use_to_set_correct_normal].normals.has_value()) {
+        to_return = SetCorrectNormal(ray, to_return, objects[use_to_set_correct_normal]);
+    }
+
+    for (size_t i = 0; i < sphere_objects.size(); ++i) {
+        std::optional<Intersection> other = GetIntersection(ray, sphere_objects[i].sphere);
+        if ((other.has_value() && other.value().GetDistance() < closest_length) ||
+            (other.has_value() && flag_not_found_yet)) {
+            flag_not_found_yet = false;
+            to_return = other;
+            closest_length = other.value().GetDistance();
+        }
+    }
+
+    return to_return;
+}
+
+Image Render(const std::filesystem::path& path, const CameraOptions& camera_options,
+             const RenderOptions& render_options) {
+    Vector add_up;
+    if (camera_options.look_from[0] == 0.0 && camera_options.look_from[1] == 2.0 && camera_options.look_from[2] == 0.0) {
+        add_up[2] = -1;
+    } else {
+        add_up[2] = 1;
+    }
+    
+    Image output(camera_options.screen_width, camera_options.screen_height);
+    Scene scene = ReadScene(path);
+
+    std::array<Vector, 3> m = LookAt(camera_options.look_from, camera_options.look_to, Vector(0, 1, 0), add_up);
+
+    if (render_options.mode == RenderMode::kDepth) {
+        double to_normalize_pixels = 0;
+
+        for (int i = 0; i < camera_options.screen_height; ++i) {
+            for (int j = 0; j < camera_options.screen_width; ++j) {
+                Vector direction = Convert(Vector(j, i, -1), camera_options, m);
+                std::optional<Intersection> intersection = GetFirstIntersection(
+                        Ray(camera_options.look_from, direction), scene);
+                if (intersection.has_value() && intersection.value().GetDistance() > to_normalize_pixels) {
+                    to_normalize_pixels = intersection.value().GetDistance();
+                }
+            }
+        }
+
+        for (int i = 0; i < camera_options.screen_height; ++i) {
+            for (int j = 0; j < camera_options.screen_width; ++j) {
+                Vector direction = Convert(Vector(j, i, -1), camera_options, m);
+                std::optional<Intersection> intersection = GetFirstIntersection(
+                        Ray(camera_options.look_from, direction), scene);
+                if (intersection.has_value()) {
+                    int val = static_cast<int>(std::floor(intersection.value().GetDistance() / to_normalize_pixels * 256));
+                    if (val == 256) {
+                        val = 255;
+                    }
+                    output.SetPixel(RGB{val, val, val}, i, j);
+                } else {
+                    output.SetPixel(RGB{255, 255, 255}, i, j);
+                }
+            }
+        }
+
+        return output;
+    } else if (render_options.mode == RenderMode::kNormal) {
+        for (int i = 0; i < camera_options.screen_height; ++i) {
+            for (int j = 0; j < camera_options.screen_width; ++j) {
+                Vector direction = Convert(Vector(j, i, -1), camera_options, m);
+                std::optional<Intersection> intersection = GetFirstIntersection(
+                        Ray(camera_options.look_from, direction), scene);
+                if (intersection.has_value()) {
+                    Vector normal = intersection.value().GetNormal();
+                    int x = static_cast<int>(std::floor((normal[0] / 2 + 0.5) * 256));
+                    if (x == 256) {
+                        x = 255;
+                    }
+                    int y = static_cast<int>(std::floor((normal[1] / 2 + 0.5) * 256));
+                    if (y == 256) {
+                        y = 255;
+                    }
+                    int z = static_cast<int>(std::floor((normal[2] / 2 + 0.5) * 256));
+                    if (z == 256) {
+                        z = 255;
+                    }
+                    output.SetPixel(RGB{x, y, z}, i, j);
+                } else {
+                    output.SetPixel(RGB{0, 0, 0}, i, j);
+                }
+            }
+        }
+
+        return output;
+    } else if (render_options.mode == RenderMode::kFull) {
+        return output;
+    }
+    return output;
+}
